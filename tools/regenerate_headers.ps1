@@ -17,7 +17,8 @@ Write-Host "Using fromsoftware-rs: $fsrs"
 Write-Host "Output dir: $out"
 Push-Location $gen
 try {
-  cargo run --release -- --fsrs $fsrs --out $out
+  cargo run --release --bin eldenring_cpp_gen -- --fsrs $fsrs --out $out
+  cargo run --release --bin api_gen -- --fsrs $fsrs --out $out --report (Join-Path $root "api_parity_report.md")
 } finally {
   Pop-Location
 }

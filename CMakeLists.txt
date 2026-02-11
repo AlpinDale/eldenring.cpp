@@ -20,6 +20,9 @@ if(EXISTS "${ELDENRING_CPP_FSRS_DIR}/Cargo.toml")
     add_custom_target(eldenring_cpp_generate
         COMMAND cargo run --release -- --fsrs "${ELDENRING_CPP_FSRS_DIR}"
                 --out "${CMAKE_CURRENT_SOURCE_DIR}/include/eldenring"
+        COMMAND cargo run --release --bin api_gen -- --fsrs "${ELDENRING_CPP_FSRS_DIR}"
+                --out "${CMAKE_CURRENT_SOURCE_DIR}/include/eldenring"
+                --report "${CMAKE_CURRENT_SOURCE_DIR}/api_parity_report.md"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate"
         COMMENT "Regenerating eldenring.cpp headers"
         VERBATIM

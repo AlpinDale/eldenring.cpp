@@ -13,4 +13,5 @@ fi
 echo "Using fromsoftware-rs: $fsrs"
 echo "Output dir: $out"
 cd "$root/tools/generate"
-cargo run --release -- --fsrs "$fsrs" --out "$out"
+cargo run --release --bin eldenring_cpp_gen -- --fsrs "$fsrs" --out "$out"
+cargo run --release --bin api_gen -- --fsrs "$fsrs" --out "$out" --report "$root/api_parity_report.md"
