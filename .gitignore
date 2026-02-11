@@ -90,3 +90,5 @@ target
 #.idea/
 
 _msvc_smoke/
+api_parity_report.md
+api_stub_summary.md

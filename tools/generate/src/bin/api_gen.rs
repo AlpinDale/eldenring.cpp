@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use quote::ToTokens;
 use syn::{
-    File, FnArg, GenericArgument, Generics, ImplItem, Item, Lit, PathArguments, ReturnType, Type,
-    Visibility,
+    BinOp, Expr, File, FnArg, GenericArgument, Generics, ImplItem, Item, Lit, Member, PathArguments,
+    ReturnType, Stmt, Type, UnOp, Visibility,
 };
 use walkdir::WalkDir;
 
@@ -41,6 +41,7 @@ struct FnDef {
     kind: String,
     impl_name: Option<String>,
     impl_self_ty: Option<Type>,
+    impl_generics: Vec<String>,
     pattern: FnPattern,
     rva: Option<String>,
     sig: syn::Signature,
@@ -55,6 +56,29 @@ enum FnPattern {
     RvaCall,
     LoadStaticDirect,
     LoadStaticIndirect,
+    FieldGet { field: String },
+    FieldGetRef { field: String },
+    FieldSet { field: String, value: String },
+    BitGet { field: String, mask: String, shift: String },
+    BitSet {
+        field: String,
+        mask: String,
+        shift: String,
+        value: String,
+    },
+    FieldMethodCall {
+        api_type: String,
+        field: String,
+        method: String,
+        args: Vec<String>,
+    },
+    Compare {
+        lhs: String,
+        op: String,
+        rhs: String,
+    },
+    Cast { expr: String },
+    UnaryNot { expr: String },
 }
 
 #[derive(Clone, Debug)]
@@ -444,6 +468,338 @@ fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(t) if t.elems.is_empty())
 }
 
+fn unparen_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(p) => unparen_expr(&p.expr),
+        Expr::Group(g) => unparen_expr(&g.expr),
+        _ => expr,
+    }
+}
+
+fn path_ident(expr: &Expr) -> Option<String> {
+    if let Expr::Path(p) = unparen_expr(expr) {
+        if p.qself.is_none() && p.path.segments.len() == 1 {
+            return Some(p.path.segments[0].ident.to_string());
+        }
+    }
+    None
+}
+
+fn extract_self_field(expr: &Expr) -> Option<String> {
+    if let Expr::Field(f) = unparen_expr(expr) {
+        if let Expr::Path(p) = unparen_expr(&f.base) {
+            if p.qself.is_none()
+                && p.path.segments.len() == 1
+                && p.path.segments[0].ident == "self"
+            {
+                if let Member::Named(id) = &f.member {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_self_field_ref(expr: &Expr) -> Option<String> {
+    if let Expr::Reference(r) = unparen_expr(expr) {
+        let field = extract_self_field(&r.expr)?;
+        return Some(field);
+    }
+    None
+}
+
+fn match_lit_int(expr: &Expr) -> Option<String> {
+    if let Expr::Lit(lit) = unparen_expr(expr) {
+        if let Lit::Int(i) = &lit.lit {
+            return Some(i.base10_digits().to_string());
+        }
+    }
+    None
+}
+
+fn literal_to_cpp(lit: &Lit) -> Option<String> {
+    match lit {
+        Lit::Int(i) => Some(i.base10_digits().to_string()),
+        Lit::Bool(b) => Some(b.value.to_string()),
+        Lit::Char(c) => Some(format!("'{}'", c.value())),
+        Lit::Byte(b) => Some((b.value() as u8).to_string()),
+        _ => None,
+    }
+}
+
+fn expr_to_cpp_simple(expr: &Expr) -> Option<String> {
+    match unparen_expr(expr) {
+        Expr::Field(_) => extract_self_field(expr).map(|f| format!("self->{}", f)),
+        Expr::Reference(r) => {
+            let inner = expr_to_cpp_simple(&r.expr)?;
+            Some(format!("&{}", inner))
+        }
+        Expr::MethodCall(m) => {
+            if m.args.is_empty() {
+                if let Expr::Path(p) = unparen_expr(&m.receiver) {
+                    if p.qself.is_none()
+                        && p.path.segments.len() == 1
+                        && p.path.segments[0].ident == "self"
+                    {
+                        let name = sanitize_ident(&m.method.to_string());
+                        return Some(format!("{}(self)", name));
+                    }
+                }
+            }
+            None
+        }
+        Expr::Path(p) => {
+            if p.qself.is_none() && p.path.segments.len() == 1 {
+                Some(sanitize_ident(&p.path.segments[0].ident.to_string()))
+            } else {
+                None
+            }
+        }
+        Expr::Call(call) => {
+            if let Expr::Path(p) = unparen_expr(&call.func) {
+                if p.qself.is_none() && p.path.segments.len() == 1 {
+                    let name = sanitize_ident(&p.path.segments[0].ident.to_string());
+                    let mut args = Vec::new();
+                    for arg in &call.args {
+                        args.push(expr_to_cpp_simple(arg)?);
+                    }
+                    return Some(format!("{}({})", name, args.join(", ")));
+                }
+            }
+            None
+        }
+        Expr::Lit(lit) => literal_to_cpp(&lit.lit),
+        Expr::Unary(u) => {
+            if matches!(u.op, UnOp::Neg(_)) {
+                let inner = expr_to_cpp_simple(&u.expr)?;
+                return Some(format!("-{}", inner));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn match_self_field_method_call(expr: &Expr) -> Option<(String, String, Vec<String>)> {
+    if let Expr::MethodCall(m) = unparen_expr(expr) {
+        let field = extract_self_field(&m.receiver)?;
+        let method = sanitize_ident(&m.method.to_string());
+        let mut args = Vec::new();
+        for arg in &m.args {
+            args.push(expr_to_cpp_simple(arg)?);
+        }
+        return Some((field, method, args));
+    }
+    None
+}
+
+fn cpp_type_to_api_type(cpp_type: &str) -> Option<String> {
+    let cpp_type = cpp_type.trim();
+    if cpp_type.contains('*') {
+        return None;
+    }
+    let mut base = cpp_type.to_string();
+    let mut args = None;
+    if let Some(pos) = cpp_type.find('<') {
+        base = cpp_type[..pos].to_string();
+        if cpp_type.ends_with('>') {
+            args = Some(cpp_type[pos + 1..cpp_type.len() - 1].to_string());
+        }
+    }
+    let mut parts: Vec<String> = base.split("::").map(|s| s.to_string()).collect();
+    if parts.first().map(|s| s.as_str()) != Some("eldenring") {
+        return None;
+    }
+    parts.insert(1, "api".to_string());
+    if let Some(last) = parts.last_mut() {
+        *last = format!("{}Api", last);
+    }
+    let api_base = parts.join("::");
+    match args {
+        Some(a) if !a.is_empty() => Some(format!("{}<{}>", api_base, a)),
+        _ => Some(api_base),
+    }
+}
+
+fn binop_to_cpp(op: &BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Eq(_) => Some("=="),
+        BinOp::Ne(_) => Some("!="),
+        BinOp::Lt(_) => Some("<"),
+        BinOp::Le(_) => Some("<="),
+        BinOp::Gt(_) => Some(">"),
+        BinOp::Ge(_) => Some(">="),
+        _ => None,
+    }
+}
+
+fn match_shift_expr(expr: &Expr) -> Option<(String, String)> {
+    if let Expr::Binary(bin) = unparen_expr(expr) {
+        if matches!(bin.op, BinOp::Shl(_)) {
+            let mask = match_lit_int(&bin.left)?;
+            let shift = match_lit_int(&bin.right)?;
+            return Some((mask, shift));
+        }
+    }
+    None
+}
+
+fn match_bit_get(expr: &Expr) -> Option<(String, String, String)> {
+    if let Expr::Binary(bin) = unparen_expr(expr) {
+        if matches!(bin.op, BinOp::BitAnd(_)) {
+            let mask = match_lit_int(&bin.right)?;
+            if let Expr::Binary(shr) = unparen_expr(&bin.left) {
+                if matches!(shr.op, BinOp::Shr(_)) {
+                    let field = extract_self_field(&shr.left)?;
+                    let shift = match_lit_int(&shr.right)?;
+                    return Some((field, mask, shift));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_bitset_left(expr: &Expr) -> Option<(String, String, String)> {
+    if let Expr::Binary(bin) = unparen_expr(expr) {
+        if matches!(bin.op, BinOp::BitAnd(_)) {
+            let field = extract_self_field(&bin.left)?;
+            if let Expr::Unary(un) = unparen_expr(&bin.right) {
+                if matches!(un.op, UnOp::Not(_)) {
+                    let (mask, shift) = match_shift_expr(&un.expr)?;
+                    return Some((field, mask, shift));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_bitset_right(expr: &Expr) -> Option<(String, String, String)> {
+    if let Expr::Binary(bin) = unparen_expr(expr) {
+        if matches!(bin.op, BinOp::Shl(_)) {
+            let shift = match_lit_int(&bin.right)?;
+            if let Expr::Binary(and) = unparen_expr(&bin.left) {
+                if matches!(and.op, BinOp::BitAnd(_)) {
+                    let value = path_ident(&and.left)?;
+                    let mask = match_lit_int(&and.right)?;
+                    return Some((value, mask, shift));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_bit_set(expr: &Expr) -> Option<(String, String, String, String)> {
+    if let Expr::Assign(assign) = unparen_expr(expr) {
+        let field = extract_self_field(&assign.left)?;
+        if let Expr::Binary(bin) = unparen_expr(&assign.right) {
+            if matches!(bin.op, BinOp::BitOr(_)) {
+                let (left_field, mask1, shift1) = match_bitset_left(&bin.left)?;
+                let (value, mask2, shift2) = match_bitset_right(&bin.right)?;
+                if field == left_field && mask1 == mask2 && shift1 == shift2 {
+                    return Some((field, mask1, shift1, value));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_simple_pattern(
+    block: &syn::Block,
+    struct_fields: Option<&HashMap<String, Type>>,
+    crate_root: &str,
+    current_ns: &str,
+    generics: &[String],
+    use_map: &HashMap<String, Vec<String>>,
+) -> Option<FnPattern> {
+    if block.stmts.len() != 1 {
+        return None;
+    }
+    match &block.stmts[0] {
+        Stmt::Expr(expr, None) => {
+            if let Some((field, method, args)) = match_self_field_method_call(expr) {
+                if let Some(fields) = struct_fields {
+                    if let Some(field_ty) = fields.get(&field) {
+                        if let Some(cpp_ty) = type_to_cpp(
+                            field_ty,
+                            crate_root,
+                            current_ns,
+                            generics,
+                            use_map,
+                            None,
+                        ) {
+                            if let Some(api_type) = cpp_type_to_api_type(&cpp_ty) {
+                                return Some(FnPattern::FieldMethodCall {
+                                    api_type,
+                                    field,
+                                    method,
+                                    args,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((field, mask, shift)) = match_bit_get(expr) {
+                return Some(FnPattern::BitGet { field, mask, shift });
+            }
+            if let Some(field) = match_self_field_ref(expr) {
+                return Some(FnPattern::FieldGetRef { field });
+            }
+            if let Some(field) = extract_self_field(expr) {
+                return Some(FnPattern::FieldGet { field });
+            }
+            if let Expr::Binary(bin) = unparen_expr(expr) {
+                if let Some(op) = binop_to_cpp(&bin.op) {
+                    let lhs = expr_to_cpp_simple(&bin.left)?;
+                    let rhs = expr_to_cpp_simple(&bin.right)?;
+                    return Some(FnPattern::Compare {
+                        lhs,
+                        op: op.to_string(),
+                        rhs,
+                    });
+                }
+            }
+            if let Expr::Cast(cast) = unparen_expr(expr) {
+                let inner = expr_to_cpp_simple(&cast.expr)?;
+                return Some(FnPattern::Cast { expr: inner });
+            }
+            if let Expr::Unary(un) = unparen_expr(expr) {
+                if matches!(un.op, UnOp::Not(_)) {
+                    let inner = expr_to_cpp_simple(&un.expr)?;
+                    return Some(FnPattern::UnaryNot { expr: inner });
+                }
+            }
+        }
+        Stmt::Expr(expr, Some(_)) => {
+            if let Some((field, mask, shift, value)) = match_bit_set(expr) {
+                return Some(FnPattern::BitSet {
+                    field,
+                    mask,
+                    shift,
+                    value: sanitize_ident(&value),
+                });
+            }
+            if let Expr::Assign(assign) = unparen_expr(expr) {
+                if let Some(field) = extract_self_field(&assign.left) {
+                    if let Some(value) = path_ident(&assign.right) {
+                        return Some(FnPattern::FieldSet {
+                            field,
+                            value: sanitize_ident(&value),
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 fn type_to_cpp(
     ty: &Type,
     crate_root: &str,
@@ -602,7 +958,19 @@ fn extract_rva_field(block: &syn::Block) -> Option<String> {
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
-fn detect_pattern(block: &syn::Block) -> (FnPattern, Option<String>) {
+fn detect_pattern(
+    block: &syn::Block,
+    struct_fields: Option<&HashMap<String, Type>>,
+    crate_root: &str,
+    current_ns: &str,
+    generics: &[String],
+    use_map: &HashMap<String, Vec<String>>,
+) -> (FnPattern, Option<String>) {
+    if let Some(pattern) =
+        detect_simple_pattern(block, struct_fields, crate_root, current_ns, generics, use_map)
+    {
+        return (pattern, None);
+    }
     let s = block.to_token_stream().to_string();
     let rva = extract_rva_field(block);
 
@@ -637,6 +1005,15 @@ fn pattern_label(pattern: &FnPattern) -> &'static str {
         FnPattern::RvaCall => "rva_call",
         FnPattern::LoadStaticDirect => "load_static_direct",
         FnPattern::LoadStaticIndirect => "load_static_indirect",
+        FnPattern::FieldGet { .. } => "field_get",
+        FnPattern::FieldGetRef { .. } => "field_get_ref",
+        FnPattern::FieldSet { .. } => "field_set",
+        FnPattern::BitGet { .. } => "bit_get",
+        FnPattern::BitSet { .. } => "bit_set",
+        FnPattern::FieldMethodCall { .. } => "field_method_call",
+        FnPattern::Compare { .. } => "compare",
+        FnPattern::Cast { .. } => "cast",
+        FnPattern::UnaryNot { .. } => "unary_not",
     }
 }
 
@@ -679,85 +1056,141 @@ fn emit_body(
     ret: &str,
     param_names: &[String],
 ) -> String {
-    let args = if param_names.is_empty() {
-        String::new()
-    } else {
-        param_names.join(", ")
-    };
-    let args_with_comma = if args.is_empty() {
-        String::new()
-    } else {
-        format!(", {}", args)
-    };
-    let rva_name = match rva {
-        Some(name) => name.as_str(),
-        None => return emit_stub_body(ret, param_names),
-    };
-
     match pattern {
-        FnPattern::RvaCall => {
+        FnPattern::FieldGet { field } => format!("return self->{};", field),
+        FnPattern::FieldGetRef { field } => format!("return &self->{};", field),
+        FnPattern::FieldSet { field, value } => format!("self->{} = {};", field, value),
+        FnPattern::BitGet { field, mask, shift } => {
+            format!("return (self->{} >> {}) & {};", field, shift, mask)
+        }
+        FnPattern::BitSet {
+            field,
+            mask,
+            shift,
+            value,
+        } => format!(
+            "self->{0} = (self->{0} & ~({1} << {2})) | (({3} & {1}) << {2});",
+            field, mask, shift, value
+        ),
+        FnPattern::FieldMethodCall {
+            api_type,
+            field,
+            method,
+            args,
+        } => {
+            let mut call = format!("{}::{}(&self->{}", api_type, method, field);
+            if !args.is_empty() {
+                call.push_str(", ");
+                call.push_str(&args.join(", "));
+            }
+            call.push(')');
             if ret == "void" {
-                format!(
-                    "eldenring::api::runtime::call_rva<void>(eldenring::api::rva::get().{}{});",
-                    rva_name, args_with_comma
-                )
+                format!("{};", call)
             } else {
-                format!(
-                    "return eldenring::api::runtime::call_rva<{}>(eldenring::api::rva::get().{}{});",
-                    ret, rva_name, args_with_comma
-                )
+                format!("return {};", call)
             }
         }
-        FnPattern::RvaToVa => {
-            if ret == "void" || (!is_pointer_ret(ret) && !is_integral_ret(ret)) {
-                emit_stub_body(ret, param_names)
-            } else {
-                format!(
-                    "return eldenring::api::runtime::rva_to_va<{}>(eldenring::api::rva::get().{});",
-                    ret, rva_name
-                )
-            }
-        }
-        FnPattern::RvaValue => {
+        FnPattern::Compare { lhs, op, rhs } => format!("return {} {} {};", lhs, op, rhs),
+        FnPattern::UnaryNot { expr } => format!("return !({});", expr),
+        FnPattern::Cast { expr } => {
             if ret == "void" {
                 emit_stub_body(ret, param_names)
-            } else if is_pointer_ret(ret) {
-                format!(
-                    "return eldenring::api::runtime::rva_to_va<{}>(eldenring::api::rva::get().{});",
-                    ret, rva_name
-                )
-            } else if is_integral_ret(ret) {
-                format!(
-                    "return static_cast<{}>(eldenring::api::rva::get().{});",
-                    ret, rva_name
-                )
             } else {
-                emit_stub_body(ret, param_names)
-            }
-        }
-        FnPattern::LoadStaticDirect => {
-            if ret == "void" || !is_pointer_ret(ret) {
-                emit_stub_body(ret, param_names)
-            } else {
-                let unused = emit_unused_params(param_names);
-                format!(
-                    "{}return eldenring::api::runtime::load_static_direct<{}>(eldenring::api::rva::get().{});",
-                    unused, ret, rva_name
-                )
-            }
-        }
-        FnPattern::LoadStaticIndirect => {
-            if ret == "void" || !is_pointer_ret(ret) {
-                emit_stub_body(ret, param_names)
-            } else {
-                let unused = emit_unused_params(param_names);
-                format!(
-                    "{}return eldenring::api::runtime::load_static_indirect<{}>(eldenring::api::rva::get().{});",
-                    unused, ret, rva_name
-                )
+                format!("return static_cast<{}>({});", ret, expr)
             }
         }
         FnPattern::Stub => emit_stub_body(ret, param_names),
+        _ => {
+            let args = if param_names.is_empty() {
+                String::new()
+            } else {
+                param_names.join(", ")
+            };
+            let args_with_comma = if args.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", args)
+            };
+            let rva_name = match rva {
+                Some(name) => name.as_str(),
+                None => return emit_stub_body(ret, param_names),
+            };
+
+            match pattern {
+                FnPattern::RvaCall => {
+                    if ret == "void" {
+                        format!(
+                            "eldenring::api::runtime::call_rva<void>(eldenring::api::rva::get().{}{});",
+                            rva_name, args_with_comma
+                        )
+                    } else {
+                        format!(
+                            "return eldenring::api::runtime::call_rva<{}>(eldenring::api::rva::get().{}{});",
+                            ret, rva_name, args_with_comma
+                        )
+                    }
+                }
+                FnPattern::RvaToVa => {
+                    if ret == "void" || (!is_pointer_ret(ret) && !is_integral_ret(ret)) {
+                        emit_stub_body(ret, param_names)
+                    } else {
+                        format!(
+                            "return eldenring::api::runtime::rva_to_va<{}>(eldenring::api::rva::get().{});",
+                            ret, rva_name
+                        )
+                    }
+                }
+                FnPattern::RvaValue => {
+                    if ret == "void" {
+                        emit_stub_body(ret, param_names)
+                    } else if is_pointer_ret(ret) {
+                        format!(
+                            "return eldenring::api::runtime::rva_to_va<{}>(eldenring::api::rva::get().{});",
+                            ret, rva_name
+                        )
+                    } else if is_integral_ret(ret) {
+                        format!(
+                            "return static_cast<{}>(eldenring::api::rva::get().{});",
+                            ret, rva_name
+                        )
+                    } else {
+                        emit_stub_body(ret, param_names)
+                    }
+                }
+                FnPattern::LoadStaticDirect => {
+                    if ret == "void" || !is_pointer_ret(ret) {
+                        emit_stub_body(ret, param_names)
+                    } else {
+                        let unused = emit_unused_params(param_names);
+                        format!(
+                            "{}return eldenring::api::runtime::load_static_direct<{}>(eldenring::api::rva::get().{});",
+                            unused, ret, rva_name
+                        )
+                    }
+                }
+                FnPattern::LoadStaticIndirect => {
+                    if ret == "void" || !is_pointer_ret(ret) {
+                        emit_stub_body(ret, param_names)
+                    } else {
+                        let unused = emit_unused_params(param_names);
+                        format!(
+                            "{}return eldenring::api::runtime::load_static_indirect<{}>(eldenring::api::rva::get().{});",
+                            unused, ret, rva_name
+                        )
+                    }
+                }
+                FnPattern::Stub
+                | FnPattern::FieldGet { .. }
+                | FnPattern::FieldGetRef { .. }
+                | FnPattern::FieldSet { .. }
+                | FnPattern::BitGet { .. }
+                | FnPattern::BitSet { .. }
+                | FnPattern::FieldMethodCall { .. } => emit_stub_body(ret, param_names),
+                | FnPattern::Compare { .. }
+                | FnPattern::Cast { .. }
+                | FnPattern::UnaryNot { .. } => emit_stub_body(ret, param_names),
+            }
+        }
     }
 }
 
@@ -967,6 +1400,52 @@ fn main() -> Result<()> {
         rust_crate: "eldenring".to_string(),
     };
 
+    let mut struct_map: HashMap<String, HashMap<String, Type>> = HashMap::new();
+    for entry in WalkDir::new(&crate_info.src_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let rel = path.strip_prefix(&crate_info.src_root).unwrap();
+        let module = module_from_path(rel);
+        let key_prefix = if module.is_empty() {
+            String::new()
+        } else {
+            module.join("::")
+        };
+        let content =
+            fs::read_to_string(path).with_context(|| format!("read {:?}", path.display()))?;
+        let file =
+            syn::parse_file(&content).with_context(|| format!("parse {:?}", path.display()))?;
+        for item in file.items {
+            if let Item::Struct(s) = item {
+                let name = s.ident.to_string();
+                let key = if key_prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{}", key_prefix, name)
+                };
+                let mut fields = HashMap::new();
+                if let syn::Fields::Named(named) = s.fields {
+                    for field in named.named {
+                        if let Some(ident) = field.ident {
+                            fields.insert(ident.to_string(), field.ty);
+                        }
+                    }
+                }
+                if !fields.is_empty() {
+                    struct_map.insert(key, fields);
+                }
+            }
+        }
+    }
+
     let mut fns: Vec<FnDef> = Vec::new();
     for entry in WalkDir::new(&crate_info.src_root)
         .into_iter()
@@ -995,7 +1474,19 @@ fn main() -> Result<()> {
                         continue;
                     }
                     let block = *f.block;
-                    let (pattern, rva) = detect_pattern(&block);
+                    let current_ns = if module.is_empty() {
+                        crate_info.ns_root.join("::")
+                    } else {
+                        format!("{}::{}", crate_info.ns_root.join("::"), module.join("::"))
+                    };
+                    let (pattern, rva) = detect_pattern(
+                        &block,
+                        None,
+                        &crate_info.ns_root[0],
+                        &current_ns,
+                        &[],
+                        &use_map,
+                    );
                     fns.push(FnDef {
                         name: f.sig.ident.to_string(),
                         module: module.clone(),
@@ -1003,6 +1494,7 @@ fn main() -> Result<()> {
                         kind: "free".to_string(),
                         impl_name: None,
                         impl_self_ty: None,
+                        impl_generics: Vec::new(),
                         pattern,
                         rva,
                         sig: f.sig,
@@ -1016,7 +1508,19 @@ fn main() -> Result<()> {
                     for item in t.items {
                         if let syn::TraitItem::Fn(tf) = item {
                             let block = tf.default.unwrap_or_else(|| syn::parse_quote!({}));
-                            let (pattern, rva) = detect_pattern(&block);
+                            let current_ns = if module.is_empty() {
+                                crate_info.ns_root.join("::")
+                            } else {
+                                format!("{}::{}", crate_info.ns_root.join("::"), module.join("::"))
+                            };
+                            let (pattern, rva) = detect_pattern(
+                                &block,
+                                None,
+                                &crate_info.ns_root[0],
+                                &current_ns,
+                                &[],
+                                &use_map,
+                            );
                             fns.push(FnDef {
                                 name: tf.sig.ident.to_string(),
                                 module: module.clone(),
@@ -1024,6 +1528,7 @@ fn main() -> Result<()> {
                                 kind: "trait".to_string(),
                                 impl_name: Some(t.ident.to_string()),
                                 impl_self_ty: None,
+                                impl_generics: Vec::new(),
                                 pattern,
                                 rva,
                                 sig: tf.sig,
@@ -1040,6 +1545,18 @@ fn main() -> Result<()> {
                     let Some(self_name) = self_ty else {
                         continue;
                     };
+                    let impl_generics = generics_params(&imp.generics);
+                    let key = if module.is_empty() {
+                        self_name.clone()
+                    } else {
+                        format!("{}::{}", module.join("::"), self_name)
+                    };
+                    let struct_fields = struct_map.get(&key);
+                    let current_ns = if module.is_empty() {
+                        crate_info.ns_root.join("::")
+                    } else {
+                        format!("{}::{}", crate_info.ns_root.join("::"), module.join("::"))
+                    };
                     let is_trait_impl = imp.trait_.is_some();
                     for item in imp.items {
                         if let ImplItem::Fn(m) = item {
@@ -1047,7 +1564,14 @@ fn main() -> Result<()> {
                                 continue;
                             }
                             let block = m.block;
-                            let (pattern, rva) = detect_pattern(&block);
+                            let (pattern, rva) = detect_pattern(
+                                &block,
+                                struct_fields,
+                                &crate_info.ns_root[0],
+                                &current_ns,
+                                &impl_generics,
+                                &use_map,
+                            );
                             fns.push(FnDef {
                                 name: m.sig.ident.to_string(),
                                 module: module.clone(),
@@ -1055,6 +1579,7 @@ fn main() -> Result<()> {
                                 kind: "impl".to_string(),
                                 impl_name: Some(self_name.clone()),
                                 impl_self_ty: Some((*imp.self_ty).clone()),
+                                impl_generics: impl_generics.clone(),
                                 pattern,
                                 rva,
                                 sig: m.sig,
@@ -1201,7 +1726,7 @@ fn main() -> Result<()> {
                             ty,
                             &crate_info.ns_root[0],
                             &current_ns,
-                            &[],
+                            &f.impl_generics,
                             &f.use_map,
                             None,
                         )
@@ -1211,7 +1736,13 @@ fn main() -> Result<()> {
             api.push_str(&format!("struct {} {{\n", struct_name));
             for f in fns {
                 let sig = &f.sig;
-                let generics = generics_params(&sig.generics);
+                let mut generics = f.impl_generics.clone();
+                let sig_generics = generics_params(&sig.generics);
+                for g in sig_generics {
+                    if !generics.contains(&g) {
+                        generics.push(g);
+                    }
+                }
                 if !generics.is_empty() {
                     api.push_str("  template <");
                     let params: Vec<String> =
