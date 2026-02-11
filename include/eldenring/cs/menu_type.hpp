@@ -1,0 +1,53 @@
+#pragma once
+
+// THIS FILE IS AUTO-GENERATED. DO NOT EDIT OR FORMAT.
+
+#include <cstdint>
+#include <cstddef>
+#include <array>
+#include "eldenring/support.hpp"
+#include "eldenring/fwd.hpp"
+
+namespace eldenring {
+namespace cs {
+namespace menu_type {
+
+enum class MenuType : std::int32_t {
+  None = 0,
+  TalkList = 1,
+  Warp = 2,
+  Repository = 3,
+  RegularShop = 5,
+  SellShop = 6,
+  EquipmentChangeOfPurposeShop = 7,
+  RepairShop = 8,
+  EnhanceShop = 9,
+  Soul = 10,
+  MagicEquip = 11,
+  ConversationChoices = 12,
+  ChooseQuantityDialog = 13,
+  EstusAllotMenu = 14,
+  GenericDialog = 15,
+  CharaMakeMenu2 = 16,
+  TranspositionShop = 18,
+  ReallocateAttributes = 19,
+  UnkEvent118 = 20,
+  PhysickMenu = 21,
+  DragonCommunionShop = 22,
+  UnkEvent136 = 23,
+  UnkEvent137 = 24,
+  SmithingTableEnhanceShop = 25,
+  TailoringShop = 26,
+  AshOfWarShop = 27,
+  PuppetShop = 28,
+  UnkEvent145 = 29,
+  CharaMakeMenu = 30,
+  SeluvisFreePuppetShop = 31,
+  DupeShop = 32,
+  ChampionsEquipmentShop = 33,
+  ArenaMenu = 34,
+};
+
+}
+}
+}

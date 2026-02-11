@@ -1,0 +1,3 @@
+[submodule "third_party/fromsoftware-rs"]
+	path = third_party/fromsoftware-rs
+	url = https://github.com/vswarte/fromsoftware-rs
